@@ -1,0 +1,16 @@
+# --- AI QA WORKFLOW: LOCALHOST AUTH & GENERATION ---
+
+Step 1: Navigate to http://localhost:3000/signup
+Step 2: Locate the signup form. Use email "hassanshah9153@gmail.com" and password "helloworld" to create an account. 
+Step 3: If an error says 'Email already exists', skip to Step 4. Otherwise, verify the account was created successfully.
+Step 4: Navigate to http://localhost:3000/login
+Step 5: Log in using email "hassanshah9153@gmail.com" and password "helloworld".
+Step 6: Navigate to the Profile page (usually /profile or via the Dashboard link).
+Step 7: Scan the Profile page for all input fields (Name, Bio, Skills, etc.). Use your AI reasoning to fill every field with professional, realistic data that fits a Software Engineer persona.
+Step 8: Click the 'Save' or 'Submit' button on the Profile form and verify the data was saved.
+Step 9: Navigate to http://localhost:3000/generate
+Step 10: Identify the fields for the Cover Letter generation. Look at the page context (e.g., Job Title, Job Description) and fill them with high-quality, relevant information based on the Profile data you just entered.
+Step 11: Click the 'Generate' button.
+Step 12: Verify the letter is generated on the screen and take a screenshot of the final output.
+
+# --- END OF WORKFLOW ---

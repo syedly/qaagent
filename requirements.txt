@@ -1,0 +1,9 @@
+langchain==0.3.25
+langchain-openai==0.3.19
+langchain-community==0.3.24
+playwright==1.52.0
+python-dotenv==1.1.0
+pydantic==2.11.5
+rich==14.0.0
+faker==37.3.0
+aiofiles==24.1.0
