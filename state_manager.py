@@ -57,6 +57,8 @@ class AgentStateManager:
         self.last_page_title: str = ""
         self.start_time: datetime = datetime.now()
         self.workflow_file: str = "workflow.txt"
+        self.console_logs: list[dict[str, Any]] = []
+        self.network_events: list[dict[str, Any]] = []
 
     # ── Credential helpers ───────────────────────────────────────────
 
@@ -71,6 +73,39 @@ class AgentStateManager:
     async def store_generated_data(self, key: str, value: Any) -> None:
         async with self._lock:
             self.generated_data[key] = value
+
+    async def add_console_log(self, level: str, text: str, url: str = "") -> None:
+        async with self._lock:
+            self.console_logs.append(
+                {
+                    "timestamp": datetime.now().isoformat(timespec="seconds"),
+                    "level": level,
+                    "text": text,
+                    "url": url,
+                }
+            )
+            self.console_logs = self.console_logs[-100:]
+
+    async def add_network_event(
+        self,
+        url: str,
+        method: str,
+        status: int | None,
+        resource_type: str = "",
+        ok: bool | None = None,
+    ) -> None:
+        async with self._lock:
+            self.network_events.append(
+                {
+                    "timestamp": datetime.now().isoformat(timespec="seconds"),
+                    "url": url,
+                    "method": method,
+                    "status": status,
+                    "resource_type": resource_type,
+                    "ok": ok,
+                }
+            )
+            self.network_events = self.network_events[-200:]
 
     # ── Step result helpers ──────────────────────────────────────────
 
@@ -93,3 +128,36 @@ class AgentStateManager:
             "duration_seconds": round(duration, 2),
             "success_rate": f"{(passed / total * 100):.1f}%" if total else "N/A",
         }
+
+    def recent_steps_summary(self, limit: int = 3) -> str:
+        recent = self.step_results[-limit:]
+        if not recent:
+            return "No previous steps recorded yet."
+
+        parts = []
+        for step in recent:
+            observation = (step.observation or "").replace("\n", " ").strip()
+            if len(observation) > 140:
+                observation = observation[:137] + "..."
+            parts.append(
+                f"Step {step.step_number} [{step.status.upper()}]: {step.description} | Observation: {observation}"
+            )
+        return "\n".join(parts)
+
+    def recent_console_summary(self, limit: int = 8) -> str:
+        logs = self.console_logs[-limit:]
+        if not logs:
+            return "No recent console logs."
+        return "\n".join(
+            f"[{item['level']}] {item['text'][:180]}"
+            for item in logs
+        )
+
+    def recent_network_summary(self, limit: int = 8) -> str:
+        events = self.network_events[-limit:]
+        if not events:
+            return "No recent network events."
+        return "\n".join(
+            f"[{item['status']}] {item['method']} {item['url'][:140]}"
+            for item in events
+        )

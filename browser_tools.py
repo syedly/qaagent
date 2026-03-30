@@ -50,13 +50,44 @@ async def _find_element(page: Page, selector: str, description: str = "") -> Any
     Try primary CSS/XPath selector, then fall back to aria / text
     alternatives before raising.
     """
-    strategies = [
-        selector,
-        f"[aria-label*='{description}' i]",
-        f"[placeholder*='{description}' i]",
-        f"text='{description}'",
-        f"role=button[name*='{description}' i]",
-    ]
+    def _quoted_text_candidates(value: str) -> list[str]:
+        return re.findall(r"['\"]([^'\"]{2,})['\"]", value or "")
+
+    text_candidates: list[str] = []
+    for source in (selector, description):
+        for candidate in _quoted_text_candidates(source):
+            cleaned = re.sub(r"\s+(button|link|field|input|form)\b.*$", "", candidate, flags=re.I).strip()
+            if cleaned and cleaned not in text_candidates:
+                text_candidates.append(cleaned)
+
+    if description:
+        cleaned_description = re.sub(
+            r"\b(button|link|field|input|form|on the .*|for the .*)\b.*$",
+            "",
+            description,
+            flags=re.I,
+        ).strip()
+        if cleaned_description and cleaned_description not in text_candidates:
+            text_candidates.append(cleaned_description)
+
+    strategies = [selector]
+    for text in text_candidates:
+        escaped = text.replace('"', '\\"')
+        strategies.extend([
+            f"text='{text}'",
+            f":text('{text}')",
+            f"button:has-text(\"{escaped}\")",
+            f"[role='button']:has-text(\"{escaped}\")",
+            f"role=button[name*='{text}' i]",
+        ])
+    if description:
+        strategies.extend([
+            f"[aria-label*='{description}' i]",
+            f"[placeholder*='{description}' i]",
+            f"text='{description}'",
+            f"role=button[name*='{description}' i]",
+            f"label:text-is('{description}')",
+        ])
     for strat in strategies:
         try:
             el = page.locator(strat).first
@@ -66,7 +97,100 @@ async def _find_element(page: Page, selector: str, description: str = "") -> Any
             continue
     raise RuntimeError(
         f"Self-heal exhausted - could not locate element. "
-        f"Selector='{selector}', description='{description}'"
+        f"Selector='{selector}', description='{description}', text_candidates={text_candidates}"
+    )
+
+
+async def _wait_for_ui_settle(page: Page, timeout_ms: int = 2_500) -> None:
+    """Let modern client-side apps finish hydration and short async handlers."""
+    await page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
+    try:
+        await page.wait_for_load_state("networkidle", timeout=timeout_ms)
+    except Exception:
+        pass
+    try:
+        await page.wait_for_function(
+            """
+            () => {
+                const ready = document.readyState === 'interactive' || document.readyState === 'complete';
+                const root = document.body || document.documentElement;
+                if (!root) return ready;
+                const busy = root.querySelector('[aria-busy="true"], [data-loading="true"], [data-pending="true"]');
+                return ready && !busy;
+            }
+            """,
+            timeout=timeout_ms,
+        )
+    except Exception:
+        pass
+
+
+async def _describe_locator(el: Any) -> dict[str, Any]:
+    return await el.evaluate(
+        """
+        (node) => {
+            const text = (node.innerText || node.textContent || node.value || '').replace(/\\s+/g, ' ').trim().slice(0, 120);
+            const rect = node.getBoundingClientRect();
+            const style = window.getComputedStyle(node);
+            const inViewport = rect.width > 0 && rect.height > 0 &&
+                rect.bottom >= 0 && rect.right >= 0 &&
+                rect.top <= window.innerHeight && rect.left <= window.innerWidth;
+            return {
+                tag: node.tagName.toLowerCase(),
+                id: node.id || null,
+                name: node.getAttribute('name'),
+                type: node.getAttribute('type'),
+                text,
+                disabled: !!node.disabled,
+                ariaDisabled: node.getAttribute('aria-disabled'),
+                hidden: style.visibility === 'hidden' || style.display === 'none',
+                inViewport,
+            };
+        }
+        """
+    )
+
+
+async def _click_and_report(page: Page, el: Any, selector: str, description: str = "") -> str:
+    before_url = page.url
+    before_state = await _describe_locator(el)
+
+    try:
+        await el.scroll_into_view_if_needed()
+        await _wait_for_ui_settle(page, timeout_ms=2_000)
+        await el.click(timeout=8_000)
+        await _wait_for_ui_settle(page, timeout_ms=2_500)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Click failed for selector='{selector}' description='{description}': {exc}"
+        ) from exc
+
+    after_url = page.url
+    still_present = await el.count() > 0
+    after_state: dict[str, Any] | None = None
+    if still_present:
+        try:
+            after_state = await _describe_locator(el)
+        except Exception:
+            after_state = None
+
+    url_changed = before_url != after_url
+    button_was_enabled = not before_state.get("disabled") and before_state.get("ariaDisabled") != "true"
+
+    if url_changed:
+        return (
+            f"Click dispatched for '{selector}'. URL changed from '{before_url}' to '{after_url}'. "
+            f"Element before click: {json.dumps(before_state)}"
+        )
+
+    return (
+        f"Click dispatched for '{selector}', but URL did not change. "
+        f"Element before click: {json.dumps(before_state)}. "
+        f"Element after click: {json.dumps(after_state) if after_state else 'detached/unavailable'}. "
+        f"Enabled before click: {button_was_enabled}. "
+        "Do not assume the element was disabled. This usually means client-side validation, hydration, "
+        "or in-page state changed without navigation. Verify the result with verify_condition, inspect with get_page_dom, "
+        "or inspect network/console evidence with get_runtime_signals."
     )
 
 
@@ -116,6 +240,11 @@ class ScrollInput(BaseModel):
 class ScreenshotInput(BaseModel):
     label: str = Field(default="step", description="Label for the screenshot filename")
 
+class RuntimeSignalsInput(BaseModel):
+    limit: int = Field(default=12, description="Maximum number of recent entries to include")
+    url_contains: str = Field(default="", description="Optional substring to filter network request URLs")
+    status_code: int = Field(default=0, description="Optional exact status code to filter network events")
+
 
 # ════════════════════════════════════════════════════════════════════
 #  Tool factory — builds tool instances bound to a state manager
@@ -160,11 +289,9 @@ def build_tools(state: AgentStateManager) -> list[BaseTool]:
             page = state.page
             try:
                 el = await _find_element(page, selector, description)
-                await el.scroll_into_view_if_needed()
-                await el.click(timeout=8_000)
-                await page.wait_for_load_state("domcontentloaded", timeout=10_000)
+                result = await _click_and_report(page, el, selector, description)
                 state.current_url = page.url
-                return f"Clicked '{selector}'. Current URL: {state.current_url}"
+                return result
             except Exception as exc:
                 path = await _take_screenshot(page, "click_failure")
                 return f"ERROR clicking '{selector}': {exc}. Screenshot: {path}"
@@ -300,23 +427,86 @@ def build_tools(state: AgentStateManager) -> list[BaseTool]:
 
             # Extract a structured summary
             data = await page.evaluate("""() => {
-                const get = (sel) => [...document.querySelectorAll(sel)].map(el => ({
-                    tag: el.tagName.toLowerCase(),
-                    id: el.id || null,
-                    name: el.name || null,
-                    type: el.type || null,
-                    placeholder: el.placeholder || null,
-                    ariaLabel: el.getAttribute('aria-label'),
-                    text: (el.innerText || el.value || '').slice(0, 80).trim(),
-                    selector: el.id ? '#' + el.id : (el.name ? `[name="${el.name}"]` : null),
-                }));
+                const seen = new WeakSet();
+                const all = [];
+
+                const buildSelector = (el) => {
+                    if (el.id) return `#${el.id}`;
+                    const testId = el.getAttribute('data-testid') || el.getAttribute('data-test') || el.getAttribute('data-cy');
+                    if (testId) return `[data-testid="${testId}"], [data-test="${testId}"], [data-cy="${testId}"]`;
+                    if (el.name) return `[name="${el.name}"]`;
+                    if (el.getAttribute('aria-label')) return `[aria-label="${el.getAttribute('aria-label')}"]`;
+                    return null;
+                };
+
+                const pushNode = (el) => {
+                    if (!el || el.nodeType !== Node.ELEMENT_NODE || seen.has(el)) return;
+                    seen.add(el);
+                    all.push(el);
+                };
+
+                const walk = (root) => {
+                    if (!root) return;
+                    const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+                    let node = walker.currentNode;
+                    while (node) {
+                        pushNode(node);
+                        if (node.shadowRoot) walk(node.shadowRoot);
+                        node = walker.nextNode();
+                    }
+                };
+
+                walk(document);
+
+                const summarize = (els) => els.map(el => {
+                    const text = (el.innerText || el.textContent || el.value || '').replace(/\\s+/g, ' ').trim().slice(0, 120);
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    const label = el.labels ? [...el.labels].map(x => x.innerText.trim()).join(' | ').slice(0, 120) : null;
+                    return {
+                        tag: el.tagName.toLowerCase(),
+                        id: el.id || null,
+                        name: el.getAttribute('name'),
+                        type: el.getAttribute('type'),
+                        role: el.getAttribute('role'),
+                        placeholder: el.getAttribute('placeholder'),
+                        ariaLabel: el.getAttribute('aria-label'),
+                        text,
+                        label,
+                        disabled: !!el.disabled,
+                        ariaDisabled: el.getAttribute('aria-disabled'),
+                        form: el.form ? (el.form.id || el.form.getAttribute('name') || el.form.getAttribute('action') || 'form') : null,
+                        inShadowDom: !!el.getRootNode && el.getRootNode() instanceof ShadowRoot,
+                        visible: style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0,
+                        selector: buildSelector(el),
+                    };
+                });
+
+                const filtered = (predicate, limit) => summarize(all.filter(predicate).slice(0, limit));
+                const visibleTextSnippets = all
+                    .filter(el => {
+                        if (!(el instanceof HTMLElement)) return false;
+                        const rect = el.getBoundingClientRect();
+                        const style = window.getComputedStyle(el);
+                        const text = (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+                        if (!text || text.length < 3 || text.length > 160) return false;
+                        if (style.display === 'none' || style.visibility === 'hidden') return false;
+                        if (rect.width <= 0 || rect.height <= 0) return false;
+                        return el.matches('[role="alert"], [role="status"], [aria-live], .toast, .alert, .error, .success, .message, .notification, p, div, span');
+                    })
+                    .map(el => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 160))
+                    .filter((text, idx, arr) => arr.indexOf(text) === idx)
+                    .slice(0, 20);
                 return {
                     url: location.href,
                     title: document.title,
-                    inputs: get('input, textarea, select'),
-                    buttons: get('button, [type="submit"], [role="button"]'),
-                    links: get('a[href]').slice(0, 20),
-                    headings: get('h1,h2,h3').slice(0, 10),
+                    readyState: document.readyState,
+                    inputs: filtered(el => el.matches('input, textarea, select'), 40),
+                    buttons: filtered(el => el.matches('button, [type="submit"], [role="button"], input[type="button"]'), 40),
+                    links: filtered(el => el.matches('a[href]'), 20),
+                    headings: filtered(el => el.matches('h1, h2, h3'), 10),
+                    forms: filtered(el => el.matches('form'), 10),
+                    messages: visibleTextSnippets,
                 };
             }""")
             return json.dumps(data, indent=2)[:6_000]
@@ -404,6 +594,49 @@ def build_tools(state: AgentStateManager) -> list[BaseTool]:
             path = await _take_screenshot(page, label)
             return f"Screenshot saved: {path}"
 
+    class RuntimeSignalsTool(BaseTool):
+        name: str = "get_runtime_signals"
+        description: str = (
+            "Inspect recent non-visual browser signals from console and network. "
+            "Use this when the UI is ambiguous after a click or form submission. "
+            "A recent 2xx/3xx API response can be evidence of success. "
+            "Input: {limit: int, url_contains: str, status_code: int}"
+        )
+        args_schema: Type[BaseModel] = RuntimeSignalsInput
+
+        def _run(self, **kwargs: Any) -> str:  # pragma: no cover
+            raise NotImplementedError
+
+        async def _arun(self, limit: int = 12, url_contains: str = "", status_code: int = 0) -> str:
+            network = list(state.network_events)
+            console = list(state.console_logs)
+
+            if url_contains:
+                network = [item for item in network if url_contains.lower() in (item.get("url") or "").lower()]
+
+            if status_code:
+                network = [item for item in network if item.get("status") == status_code]
+
+            network = network[-limit:]
+            console = console[-limit:]
+
+            success_candidates = [
+                item for item in network
+                if isinstance(item.get("status"), int) and 200 <= item["status"] < 400
+            ]
+            error_candidates = [
+                item for item in network
+                if isinstance(item.get("status"), int) and item["status"] >= 400
+            ]
+
+            payload = {
+                "current_url": state.current_url,
+                "recent_success_responses": success_candidates[-limit:],
+                "recent_error_responses": error_candidates[-limit:],
+                "recent_console": console,
+            }
+            return json.dumps(payload, indent=2)[:7000]
+
     # ── Assemble and return ───────────────────────────────────────────
     return [
         NavigateTool(),
@@ -417,4 +650,5 @@ def build_tools(state: AgentStateManager) -> list[BaseTool]:
         RecallCredentialTool(),
         ScrollTool(),
         ScreenshotTool(),
+        RuntimeSignalsTool(),
     ]

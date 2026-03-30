@@ -62,6 +62,39 @@ async def _launch_browser(state: AgentStateManager, headless: bool) -> None:
     )
     page = await context.new_page()
 
+    page.on(
+        "console",
+        lambda msg: asyncio.create_task(
+            state.add_console_log(
+                level=msg.type,
+                text=msg.text,
+                url=page.url,
+            )
+        ),
+    )
+    page.on(
+        "pageerror",
+        lambda exc: asyncio.create_task(
+            state.add_console_log(
+                level="pageerror",
+                text=str(exc),
+                url=page.url,
+            )
+        ),
+    )
+    page.on(
+        "response",
+        lambda response: asyncio.create_task(
+            state.add_network_event(
+                url=response.url,
+                method=response.request.method,
+                status=response.status,
+                resource_type=response.request.resource_type,
+                ok=response.ok,
+            )
+        ),
+    )
+
     state.browser = browser
     state.context = context
     state.page    = page

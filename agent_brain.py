@@ -90,8 +90,20 @@ RULES:
 7. Report PASS or FAIL clearly at the end of each step.
 8. Never hallucinate element selectors — always inspect the DOM first when unsure.
 
+9. Never claim a button is disabled unless a tool explicitly reports disabled=true or aria-disabled=true.
+10. If a click does not change the URL, treat it as an in-page SPA interaction until verification proves otherwise.
+11. If the UI is unclear after a click or submit, inspect get_runtime_signals before failing. Recent 2xx/3xx network responses may prove success.
+12. Prefer objective evidence in this order: visible success message, persisted field values/new content, network response status, then console errors.
+
 Current credentials store: {credentials}
 Current URL: {current_url}
+Current page title: {page_title}
+Recent completed steps:
+{recent_steps}
+Recent network events:
+{recent_network}
+Recent console logs:
+{recent_console}
 """
 
 
@@ -157,6 +169,10 @@ class AgentBrain:
                         "input": self._build_prompt(step),
                         "credentials": json.dumps(self.state.credentials),
                         "current_url": self.state.current_url,
+                        "page_title": self.state.last_page_title,
+                        "recent_steps": self.state.recent_steps_summary(),
+                        "recent_network": self.state.recent_network_summary(),
+                        "recent_console": self.state.recent_console_summary(),
                         "chat_history": [],
                     },
                     config={"callbacks": [self._callback]},
@@ -215,6 +231,27 @@ class AgentBrain:
     # ── Build the per-step prompt ────────────────────────────────────
 
     def _build_prompt(self, step: WorkflowStep) -> str:
+        extra_guidance = [
+            "Focus only on the current step. Do not revisit signup, login, or email checks unless this step explicitly mentions them.",
+            "If the page already reflects success for this step, verify that success and finish instead of redoing earlier actions.",
+            "For SPA pages, success may be shown by toast text, validation text disappearing, button/loading state changes, new visible content, or field values remaining saved after a short wait.",
+            "If visual evidence is weak, use get_runtime_signals to inspect recent network responses and console logs before deciding the step failed.",
+        ]
+
+        step_text = step.description.lower()
+        if "profile" in step_text and ("save" in step_text or "submit" in step_text):
+            extra_guidance.append(
+                "For a profile save step, verify profile-related success only: success message, saved field values, disabled loading spinner ending, or unchanged populated fields after save. Do not reason about account creation or email existence."
+            )
+        if "generate" in step_text:
+            extra_guidance.append(
+                "For generation steps, verify generated output, loading completion, or new text on the page. Do not switch back to profile or signup logic."
+            )
+        if "email already exists" in step_text:
+            extra_guidance.append(
+                "If the page already shows an 'Email already exists' style message, treat that as the expected branch for this step and move on without retrying signup."
+            )
+
         return (
             f"Execute Step {step.number}: {step.description}\n\n"
             "Instructions:\n"
@@ -222,5 +259,7 @@ class AgentBrain:
             "2. Use get_page_dom if you need to inspect the page before acting.\n"
             "3. Execute the actions one at a time.\n"
             "4. Verify the outcome after each significant action.\n"
-            "5. End your response with either 'Step PASSED' or 'Step FAILED: <reason>'."
+            "5. End your response with either 'Step PASSED' or 'Step FAILED: <reason>'.\n"
+            "6. Use this step-specific guidance:\n"
+            + "\n".join(f"- {item}" for item in extra_guidance)
         )
